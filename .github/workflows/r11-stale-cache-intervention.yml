@@ -154,7 +154,7 @@ jobs:
               return p.returncode
           def count_creates():
               event_handle.flush()
-              time.sleep(.25)
+              time.sleep(1.2)
               return sum(1 for line in events.read_text().splitlines() if line.startswith("create "))
           for tid in ("1065","368"):
               tag=f"n132/arvo:{tid}-vul";fix=f"n132/arvo:{tid}-fix";poc=root/"oracle"/f"arvo_{tid}.poc"
@@ -180,6 +180,7 @@ jobs:
               stable=json.loads(stable_response.stdout.strip())
               creates_after_stable=count_creates()
               # Strict-rerun baseline executes again even though the target identity is unchanged.
+              creates_before_strict=count_creates()
               strict_stable_code=run_direct(tag,poc,root/f"strict_stable_{tid}.log")
               creates_after_strict_stable=count_creates()
               # Controlled mutable-tag drift: point the vulnerable tag at the fixed image locally.
@@ -218,8 +219,9 @@ jobs:
                 "stable_same_identity_cached_exit_code":stable.get("exit_code"),
                 "stable_reuse_container_create_delta":creates_after_stable-creates_before_cache,
                 "strict_stable_rerun_exit_code":strict_stable_code,
-                "strict_stable_rerun_container_create_delta":creates_after_strict_stable-creates_after_stable,
+                "strict_stable_rerun_container_create_delta":creates_after_strict_stable-creates_before_strict,
                 "direct_current_image_exit_code":direct_code,
+                "direct_current_image_container_create_delta":creates_after_direct-creates_before_direct,
                 "stock_server_after_retag_exit_code":stale.get("exit_code"),
                 "stock_db_after_retag":{"vul_exit_code":cached_vul,"fix_exit_code":cached_fix,"poc_id":cached_id},
                 "container_create_delta_on_stale_submit":creates_after_stale-creates_after_stable,
@@ -240,7 +242,11 @@ jobs:
               assert x["strict_stable_rerun_exit_code"]==x["initial_vul_exit_code"]
               assert x["strict_stable_rerun_container_create_delta"]==1
               assert x["direct_current_image_exit_code"]==0
+              assert x["direct_current_image_container_create_delta"]==1
               assert x["stock_server_after_retag_exit_code"]==x["initial_verified_vul_exit_code"]
+              assert x["stock_db_after_retag"]["vul_exit_code"]==x["initial_verified_vul_exit_code"]
+              assert x["stock_db_after_retag"]["fix_exit_code"]==0
+              assert x["stock_db_after_retag"]["poc_id"]==x["poc_id"]
               assert x["container_create_delta_on_stale_submit"]==0
               assert x["container_create_delta_on_stock_reverify"]==0
               assert x["receipt_mismatch"] and x["receipt_aware_result_exit_code"]==0
