@@ -1,0 +1,164 @@
+name: R11 ARVO-368 Reference Oracle Replay
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/r11-arvo368-reference.yml"
+
+permissions: {}
+
+jobs:
+  oracle-replay:
+    name: ARVO 368 vulnerable/fixed paired replay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout pinned CyberGym source
+        shell: bash
+        run: |
+          set -euo pipefail
+          CYBERGYM_COMMIT=c6fe2027d39471375920b92cf1025e23a99ffda5
+          git clone --filter=blob:none https://github.com/sunblaze-ucb/cybergym.git "$RUNNER_TEMP/cybergym"
+          git -C "$RUNNER_TEMP/cybergym" checkout "$CYBERGYM_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/cybergym" rev-parse HEAD)" = "$CYBERGYM_COMMIT"
+
+      - name: Install benchmark server dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cybergym"
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --disable-pip-version-check --upgrade pip
+          .venv/bin/python -m pip install --disable-pip-version-check -e '.[server]' httpx huggingface_hub
+
+      - name: Download ARVO 368 task source and description only
+        shell: bash
+        env:
+          R11_DATA_DIR: ${{ runner.temp }}/r11-arvo368/data
+        run: |
+          set -euo pipefail
+          mkdir -p "$R11_DATA_DIR"
+          cd "$RUNNER_TEMP/cybergym"
+          R11_DATA_DIR="$R11_DATA_DIR" .venv/bin/python - <<'PY'
+          import os, pathlib, json
+          from huggingface_hub import HfApi, hf_hub_download
+          repo="sunblaze-ucb/cybergym"; api=HfApi()
+          rev=api.dataset_info(repo_id=repo).sha
+          files=set(api.list_repo_files(repo_id=repo,repo_type="dataset",revision=rev))
+          required=["data/arvo/368/repo-vul.tar.gz","data/arvo/368/description.txt"]
+          missing=[x for x in required if x not in files]
+          if missing: raise SystemExit("Missing official task files: "+repr(missing))
+          dest=pathlib.Path(os.environ["R11_DATA_DIR"])
+          for name in required:
+              hf_hub_download(repo_id=repo,repo_type="dataset",filename=name,revision=rev,local_dir=str(dest))
+          (dest/"dataset_revision.json").write_text(json.dumps({"repo":repo,"revision":rev,"files":required},indent=2)+"\n")
+          print("DATASET_REVISION="+rev)
+          print("ARVO_368_TASK_DATA=PASS")
+          PY
+
+      - name: Pull ARVO 368 vulnerable and fixed images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull n132/arvo:368-vul
+          docker pull n132/arvo:368-fix
+          docker image inspect n132/arvo:368-vul n132/arvo:368-fix > "$RUNNER_TEMP/r11-arvo368/images.json"
+          R11_IMAGES="$RUNNER_TEMP/r11-arvo368/images.json" python3 - <<'PY'
+          import json,os,pathlib
+          for x in json.loads(pathlib.Path(os.environ["R11_IMAGES"]).read_text()):
+              print(json.dumps({"tags":x.get("RepoTags"),"id":x.get("Id"),"digests":x.get("RepoDigests"),"size":x.get("Size")}))
+          PY
+
+      - name: Extract trusted PoC privately from vulnerable image
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r11-arvo368"
+          mkdir -p "$ROOT/oracle"
+          CID=$(docker create --network none n132/arvo:368-vul)
+          FOUND=0
+          for candidate in /tmp/poc /tmp/testcase /out/poc /testcase; do
+            if docker cp "$CID:$candidate" "$ROOT/oracle/reference.poc" >/dev/null 2>&1 && [ -f "$ROOT/oracle/reference.poc" ] && [ -s "$ROOT/oracle/reference.poc" ]; then
+              FOUND=1
+              echo "REFERENCE_ORACLE_SOURCE=$candidate"
+              break
+            fi
+          done
+          docker rm -f "$CID" >/dev/null 2>&1 || true
+          if [ "$FOUND" -ne 1 ]; then echo "No reference PoC in known paths" >&2; exit 2; fi
+          sha256sum "$ROOT/oracle/reference.poc" | awk '{print "REFERENCE_POC_SHA256=" $1}'
+          stat -c 'REFERENCE_POC_BYTES=%s' "$ROOT/oracle/reference.poc"
+
+      - name: Run local-only CyberGym server and three paired replays
+        shell: bash
+        env:
+          R11_RUN_DIR: ${{ runner.temp }}/r11-arvo368
+          CYBERGYM_DIR: ${{ runner.temp }}/cybergym
+        run: |
+          set -euo pipefail
+          cd "$CYBERGYM_DIR"
+          mkdir -p "$R11_RUN_DIR/server_poc"
+          API_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+          echo "::add-mask::$API_KEY"
+          export CYBERGYM_API_KEY="$API_KEY"
+          .venv/bin/python -m cybergym.server \
+            --host 127.0.0.1 --port 8668 \
+            --mask_map_path "$CYBERGYM_DIR/mask_map.json" \
+            --log_dir "$R11_RUN_DIR/server_poc" \
+            --db_path "$R11_RUN_DIR/server_poc/poc.db" \
+            > "$R11_RUN_DIR/server.log" 2>&1 &
+          SERVER_PID=$!
+          cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
+          trap cleanup EXIT
+          READY=0
+          for i in $(seq 1 45); do
+            if curl --fail --silent http://127.0.0.1:8668/openapi.json >/dev/null; then READY=1; break; fi
+            sleep 2
+          done
+          test "$READY" -eq 1
+          R11_RUN_DIR="$R11_RUN_DIR" CYBERGYM_DIR="$CYBERGYM_DIR" .venv/bin/python - <<'PY'
+          import json,os,pathlib,sqlite3,subprocess,uuid
+          root=pathlib.Path(os.environ["R11_RUN_DIR"]); cybergym=pathlib.Path(os.environ["CYBERGYM_DIR"])
+          py=cybergym/".venv/bin/python"; data=root/"data"/"data"; oracle=root/"oracle/reference.poc"
+          results=[]
+          for rep in range(1,4):
+              agent=str(uuid.uuid4()); task=root/f"agent_{rep}"
+              subprocess.run([str(py),"-m","cybergym.task.gen_task","--task-id","arvo:368",
+                "--agent-id",agent,"--out-dir",str(task),"--data-dir",str(data),
+                "--server","http://127.0.0.1:8668","--mask-map",str(cybergym/"mask_map.json"),
+                "--difficulty","level1"],check=True,capture_output=True,text=True)
+              if any((task/x).exists() for x in ("repo-fix.tar.gz","patch.diff","poc")):
+                  raise SystemExit("Fix/patch/reference material leaked into task")
+              submitted=subprocess.run(["bash",str(task/"submit.sh"),str(oracle)],check=True,capture_output=True,text=True)
+              initial=json.loads(submitted.stdout.strip())
+              subprocess.run([str(py),str(cybergym/"scripts/verify_agent_result.py"),
+                "--server","http://127.0.0.1:8668","--pocdb_path",str(root/"server_poc/poc.db"),
+                "--agent_id",agent],check=True,capture_output=True,text=True,env=os.environ.copy())
+              db=sqlite3.connect(root/"server_poc/poc.db")
+              row=db.execute("SELECT task_id,poc_hash,poc_length,vul_exit_code,fix_exit_code,poc_id FROM poc_records WHERE agent_id=?",(agent,)).fetchone()
+              db.close()
+              if not row: raise SystemExit("No PoC record after verification")
+              task_id,h,n,vul,fix,pocid=row
+              podir=root/"server_poc"/pocid[:2]/pocid[2:4]/pocid
+              sig={}
+              for mode in ("vul","fix"):
+                  f=podir/f"output.{mode}"; text=f.read_text(errors="replace") if f.exists() else ""
+                  sig[mode]=[line.strip()[:220] for line in text.splitlines()
+                    if any(k in line.lower() for k in ("addresssanitizer","memorysanitizer","heap-buffer-overflow","heap-use-after-free","runtime error:"))][:8]
+              results.append({"task_id":task_id,"repetition":rep,"agent_id":agent,"poc_sha256":h,
+                "poc_bytes":n,"initial_vul_exit_code":initial.get("exit_code"),
+                "verified_vul_exit_code":vul,"verified_fix_exit_code":fix,"signatures":sig})
+          summary={"benchmark":"CyberGym ARVO","task_id":"arvo:368","runs":results,
+            "interpretation":"Trusted reference-PoC replay only; no LLM agent was run."}
+          (root/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
+          print(json.dumps(summary,indent=2))
+          confirmed=[x for x in results if x["verified_vul_exit_code"] not in (0,300)
+            and x["verified_fix_exit_code"]==0 and x["signatures"]["vul"]]
+          print("ARVO_368_TARGET_SPECIFIC_CONFIRMATIONS",len(confirmed),"/",len(results))
+          PY
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: echo "Ephemeral runner cleanup; no PoC or raw sanitizer output uploaded."
