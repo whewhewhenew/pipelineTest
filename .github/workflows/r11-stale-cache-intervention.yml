@@ -188,8 +188,10 @@ jobs:
               current=inspect(tag)
               if current["id"]!=fixed["id"]:raise SystemExit("Tag rebind failed")
               # Direct execution against the current tag is the ground-truth check.
+              creates_before_direct=count_creates()
               direct_file=root/f"direct_current_{tid}.log"
               direct_code=run_direct(tag,poc,direct_file)
+              creates_after_direct=count_creates()
               # Same agent/task/PoC submitted again to the stock server. It should return the old cached crash.
               stale_response=subprocess.run(["bash",str(task/"submit.sh"),str(poc)],check=True,capture_output=True,text=True)
               stale=json.loads(stale_response.stdout.strip())
@@ -224,7 +226,7 @@ jobs:
                 "direct_current_image_container_create_delta":creates_after_direct-creates_before_direct,
                 "stock_server_after_retag_exit_code":stale.get("exit_code"),
                 "stock_db_after_retag":{"vul_exit_code":cached_vul,"fix_exit_code":cached_fix,"poc_id":cached_id},
-                "container_create_delta_on_stale_submit":creates_after_stale-creates_after_stable,
+                "container_create_delta_on_stale_submit":creates_after_stale-creates_after_direct,
                 "container_create_delta_on_stock_reverify":creates_after_verify-creates_after_stale,
                 "receipt_old_key":old_key,"receipt_current_key":new_key,"receipt_mismatch":receipt_mismatch,
                 "receipt_aware_action":receipt_action,
