@@ -85,6 +85,27 @@ jobs:
             sha256sum "$ROOT/oracle/arvo_${tid}.poc"
           done
 
+      - name: Extract trusted reference PoCs from vulnerable images
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r11-stale"
+          mkdir -p "$ROOT/oracle"
+          for tid in 1065 368; do
+            CID=$(docker create --network none "n132/arvo:${tid}-vul")
+            FOUND=0
+            for candidate in /tmp/poc /tmp/testcase /out/poc /testcase; do
+              if docker cp "$CID:$candidate" "$ROOT/oracle/arvo_${tid}.poc" >/dev/null 2>&1 && [ -f "$ROOT/oracle/arvo_${tid}.poc" ] && [ -s "$ROOT/oracle/arvo_${tid}.poc" ]; then
+                FOUND=1
+                echo "ARVO_${tid}_ORACLE_SOURCE=$candidate"
+                break
+              fi
+            done
+            docker rm -f "$CID" >/dev/null 2>&1 || true
+            if [ "$FOUND" -ne 1 ]; then echo "No reference PoC found for arvo:${tid}" >&2; exit 2; fi
+            sha256sum "$ROOT/oracle/arvo_${tid}.poc"
+          done
+
       - name: Execute stale-cache intervention against real vulnerable/fixed images
         shell: bash
         env:
@@ -117,8 +138,9 @@ jobs:
           root=pathlib.Path(os.environ["R11_RUN_DIR"]);cyber=pathlib.Path(os.environ["CYBERGYM_DIR"])
           py=cyber/".venv/bin/python";data=root/"data"/"data"
           events=root/"docker_events.log"
+          event_handle=events.open("w",buffering=1)
           ev=subprocess.Popen(["docker","events","--filter","type=container","--format","{{.Action}} {{.Actor.Attributes.image}}"],
-                              stdout=events.open("w"),stderr=subprocess.DEVNULL,text=True)
+                              stdout=event_handle,stderr=subprocess.DEVNULL,text=True)
           time.sleep(1)
           results=[]
           def inspect(tag):
@@ -131,8 +153,8 @@ jobs:
               out.write_text(p.stdout+"\n"+p.stderr)
               return p.returncode
           def count_creates():
-              ev.send_signal(0) if False else None
-              time.sleep(.4)
+              event_handle.flush()
+              time.sleep(.25)
               return sum(1 for line in events.read_text().splitlines() if line.startswith("create "))
           for tid in ("1065","368"):
               tag=f"n132/arvo:{tid}-vul";fix=f"n132/arvo:{tid}-fix";poc=root/"oracle"/f"arvo_{tid}.poc"
@@ -157,6 +179,9 @@ jobs:
               stable_response=subprocess.run(["bash",str(task/"submit.sh"),str(poc)],check=True,capture_output=True,text=True)
               stable=json.loads(stable_response.stdout.strip())
               creates_after_stable=count_creates()
+              # Strict-rerun baseline executes again even though the target identity is unchanged.
+              strict_stable_code=run_direct(tag,poc,root/f"strict_stable_{tid}.log")
+              creates_after_strict_stable=count_creates()
               # Controlled mutable-tag drift: point the vulnerable tag at the fixed image locally.
               subprocess.run(["docker","tag",fix,tag],check=True)
               current=inspect(tag)
@@ -192,6 +217,8 @@ jobs:
                 "initial_verified_fix_exit_code":initial_fix,
                 "stable_same_identity_cached_exit_code":stable.get("exit_code"),
                 "stable_reuse_container_create_delta":creates_after_stable-creates_before_cache,
+                "strict_stable_rerun_exit_code":strict_stable_code,
+                "strict_stable_rerun_container_create_delta":creates_after_strict_stable-creates_after_stable,
                 "direct_current_image_exit_code":direct_code,
                 "stock_server_after_retag_exit_code":stale.get("exit_code"),
                 "stock_db_after_retag":{"vul_exit_code":cached_vul,"fix_exit_code":cached_fix,"poc_id":cached_id},
@@ -201,7 +228,7 @@ jobs:
                 "receipt_aware_action":receipt_action,
                 "receipt_aware_result_exit_code":direct_code
               })
-          ev.terminate();ev.wait(timeout=5)
+          ev.terminate();ev.wait(timeout=5);event_handle.close()
           summary={"study":"Real CyberGym server stale-result cache under local target image tag rebinding",
             "tasks":results,
             "interpretation":"Controlled local tag-rebinding intervention, not a naturally observed production event. Reference PoCs are trusted benchmark inputs; no LLM agent was run."}
@@ -210,6 +237,8 @@ jobs:
           for x in results:
               assert x["stable_same_identity_cached_exit_code"]==x["initial_verified_vul_exit_code"]
               assert x["stable_reuse_container_create_delta"]==0
+              assert x["strict_stable_rerun_exit_code"]==x["initial_vul_exit_code"]
+              assert x["strict_stable_rerun_container_create_delta"]==1
               assert x["direct_current_image_exit_code"]==0
               assert x["stock_server_after_retag_exit_code"]==x["initial_verified_vul_exit_code"]
               assert x["container_create_delta_on_stale_submit"]==0
