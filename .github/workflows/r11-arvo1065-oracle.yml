@@ -91,9 +91,9 @@ jobs:
           docker pull n132/arvo:1065-fix
           docker image inspect n132/arvo:1065-vul n132/arvo:1065-fix \
             > "$RUNNER_TEMP/r11-arvo1065/image_manifest.json"
-          python3 - <<'PY'
-          import json, pathlib
-          data=json.loads(pathlib.Path("$RUNNER_TEMP/r11-arvo1065/image_manifest.json").read_text())
+          R11_RUN_DIR="$RUNNER_TEMP/r11-arvo1065" python3 - <<'PY'
+          import json, os, pathlib
+          data=json.loads((pathlib.Path(os.environ["R11_RUN_DIR"])/"image_manifest.json").read_text())
           for x in data:
               print(json.dumps({"repo_tags":x.get("RepoTags"),"id":x.get("Id"),
                                 "repo_digests":x.get("RepoDigests"),"size":x.get("Size")}))
