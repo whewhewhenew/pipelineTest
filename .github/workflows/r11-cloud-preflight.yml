@@ -1,0 +1,56 @@
+name: R11 Cloud Runner Preflight
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/r11-cloud-preflight.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  preflight:
+    name: Docker and isolation preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Record runner capacity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUNNER_OS=$RUNNER_OS"
+          echo "RUNNER_ARCH=$RUNNER_ARCH"
+          uname -a
+          echo "=== DISK ==="
+          df -h /
+          echo "=== MEMORY ==="
+          free -h
+          echo "=== DOCKER ==="
+          docker version
+          docker info --format 'Driver={{.Driver}} Cgroup={{.CgroupDriver}} Root={{.DockerRootDir}}'
+
+      - name: Verify Docker internal network support
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create --internal r11-cybergym-isolated
+          cleanup() { docker network rm r11-cybergym-isolated >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker network inspect r11-cybergym-isolated --format 'Name={{.Name}} Internal={{.Internal}}'
+          test "$(docker network inspect r11-cybergym-isolated --format '{{.Internal}}')" = "true"
+          docker run --rm --network r11-cybergym-isolated hello-world
+          echo "INTERNAL_NETWORK_PREFLIGHT=PASS"
+
+      - name: Emit capacity decision
+        shell: bash
+        run: |
+          set -euo pipefail
+          FREE_BYTES=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          echo "FREE_BYTES=$FREE_BYTES"
+          if [ "$FREE_BYTES" -ge 6442450944 ]; then
+            echo "SINGLE_TASK_IMAGE_PULL=PLAUSIBLE"
+          else
+            echo "SINGLE_TASK_IMAGE_PULL=INSUFFICIENT_DISK"
+          fi
+          echo "No vulnerable image or PoC was downloaded or executed in this preflight."
