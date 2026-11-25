@@ -1,0 +1,195 @@
+name: R11 Evidence-Preserving Receipt Guard Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/r11-receipt-guard-patch.yml"
+      - "scripts/r11_receipt_guard/sitecustomize.py"
+
+permissions: {}
+
+jobs:
+  receipt-guard:
+    name: Validate image-digest-bound recovery receipts on ARVO 1065
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout pinned CyberGym and receipt-guard prototype
+        shell: bash
+        run: |
+          set -euo pipefail
+          CYBERGYM_COMMIT=c6fe2027d39471375920b92cf1025e23a99ffda5
+          git clone --filter=blob:none https://github.com/sunblaze-ucb/cybergym.git "$RUNNER_TEMP/cybergym"
+          git -C "$RUNNER_TEMP/cybergym" checkout "$CYBERGYM_COMMIT"
+          git clone --filter=blob:none https://github.com/whewhewhenew/pipelineTest.git "$RUNNER_TEMP/pipelineTest"
+          test -f "$RUNNER_TEMP/pipelineTest/scripts/r11_receipt_guard/sitecustomize.py"
+          echo "CYBERGYM_COMMIT=$CYBERGYM_COMMIT"
+
+      - name: Install benchmark dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cybergym"
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --disable-pip-version-check --upgrade pip
+          .venv/bin/python -m pip install --disable-pip-version-check -e '.[server]' httpx huggingface_hub
+
+      - name: Download minimal ARVO 1065 task data
+        shell: bash
+        env:
+          R11_DATA_DIR: ${{ runner.temp }}/r11-guard/data
+        run: |
+          set -euo pipefail
+          mkdir -p "$R11_DATA_DIR"
+          cd "$RUNNER_TEMP/cybergym"
+          R11_DATA_DIR="$R11_DATA_DIR" .venv/bin/python - <<'PY'
+          import os,pathlib,json
+          from huggingface_hub import HfApi,hf_hub_download
+          repo="sunblaze-ucb/cybergym";api=HfApi();rev=api.dataset_info(repo_id=repo).sha
+          files=set(api.list_repo_files(repo_id=repo,repo_type="dataset",revision=rev))
+          names=["data/arvo/1065/repo-vul.tar.gz","data/arvo/1065/description.txt"]
+          if any(x not in files for x in names):raise SystemExit("Missing ARVO 1065 task material")
+          dest=pathlib.Path(os.environ["R11_DATA_DIR"])
+          for x in names:hf_hub_download(repo_id=repo,repo_type="dataset",filename=x,revision=rev,local_dir=str(dest))
+          (dest/"dataset_revision.json").write_text(json.dumps({"revision":rev,"files":names},indent=2)+"\n")
+          print("DATASET_REVISION="+rev)
+          PY
+
+      - name: Pull ARVO 1065 vulnerable and fixed images
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull n132/arvo:1065-vul
+          docker pull n132/arvo:1065-fix
+          docker image inspect n132/arvo:1065-vul n132/arvo:1065-fix > "$RUNNER_TEMP/r11-guard/images.json"
+
+      - name: Extract hidden reference PoC privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r11-guard"
+          mkdir -p "$ROOT/oracle"
+          CID=$(docker create --network none n132/arvo:1065-vul)
+          FOUND=0
+          for candidate in /tmp/poc /tmp/testcase /out/poc /testcase; do
+            if docker cp "$CID:$candidate" "$ROOT/oracle/reference.poc" >/dev/null 2>&1 && [ -f "$ROOT/oracle/reference.poc" ] && [ -s "$ROOT/oracle/reference.poc" ]; then FOUND=1; break; fi
+          done
+          docker rm -f "$CID" >/dev/null 2>&1 || true
+          test "$FOUND" -eq 1
+          sha256sum "$ROOT/oracle/reference.poc"
+
+      - name: Run stock and receipt-guarded cache across recovery
+        shell: bash
+        env:
+          R11_RUN_DIR: ${{ runner.temp }}/r11-guard
+          CYBERGYM_DIR: ${{ runner.temp }}/cybergym
+          GUARD_DIR: ${{ runner.temp }}/pipelineTest/scripts/r11_receipt_guard
+        run: |
+          set -euo pipefail
+          cd "$CYBERGYM_DIR"
+          mkdir -p "$R11_RUN_DIR/server_poc"
+          API_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+          echo "::add-mask::$API_KEY"
+          export CYBERGYM_API_KEY="$API_KEY"
+          export CYBERGYM_RECEIPT_DB="$R11_RUN_DIR/receipt_store.sqlite"
+          export CYBERGYM_VERIFIER_ID="cybergym:c6fe2027d39471375920b92cf1025e23a99ffda5+receipt-guard-v1"
+          export CYBERGYM_ORACLE_DIGEST="$(sha256sum "$CYBERGYM_DIR/mask_map.json" | cut -d' ' -f1)"
+          export PYTHONPATH="$GUARD_DIR:$CYBERGYM_DIR/src"
+          .venv/bin/python -m cybergym.server \
+            --host 127.0.0.1 --port 8670 \
+            --mask_map_path "$CYBERGYM_DIR/mask_map.json" \
+            --log_dir "$R11_RUN_DIR/server_poc" \
+            --db_path "$R11_RUN_DIR/server_poc/poc.db" \
+            > "$R11_RUN_DIR/server.log" 2>&1 &
+          SERVER_PID=$!
+          echo "$SERVER_PID" > "$R11_RUN_DIR/server.pid"
+          cleanup() { if [ -f "$R11_RUN_DIR/server.pid" ]; then kill "$(cat "$R11_RUN_DIR/server.pid")" 2>/dev/null || true; fi; }
+          trap cleanup EXIT
+          READY=0
+          for i in $(seq 1 45); do
+            curl --fail --silent http://127.0.0.1:8670/openapi.json >/dev/null && READY=1 && break
+            sleep 2
+          done
+          test "$READY" -eq 1
+          R11_RUN_DIR="$R11_RUN_DIR" CYBERGYM_DIR="$CYBERGYM_DIR" .venv/bin/python - <<'PY'
+          import hashlib,json,os,pathlib,sqlite3,subprocess,time,signal,httpx
+          root=pathlib.Path(os.environ["R11_RUN_DIR"]);cyber=pathlib.Path(os.environ["CYBERGYM_DIR"])
+          py=cyber/".venv/bin/python";oracle=root/"oracle/reference.poc";data=root/"data/data"
+          agent="r11-receipt-guard-arvo1065"
+          task=root/"agent_task"
+          subprocess.run([str(py),"-m","cybergym.task.gen_task","--task-id","arvo:1065",
+            "--agent-id",agent,"--out-dir",str(task),"--data-dir",str(data),
+            "--server","http://127.0.0.1:8670","--mask-map",str(cyber/"mask_map.json"),
+            "--difficulty","level1"],check=True,capture_output=True,text=True)
+          sub=subprocess.run(["bash",str(task/"submit.sh"),str(oracle)],check=True,capture_output=True,text=True)
+          initial=json.loads(sub.stdout.strip())
+          subprocess.run([str(py),str(cyber/"scripts/verify_agent_result.py"),"--server","http://127.0.0.1:8670",
+            "--pocdb_path",str(root/"server_poc/poc.db"),"--agent_id",agent],
+            check=True,capture_output=True,text=True,env=os.environ.copy())
+          db=sqlite3.connect(root/"server_poc/poc.db")
+          row=db.execute("SELECT poc_hash,poc_id,vul_exit_code,fix_exit_code FROM poc_records WHERE agent_id=?",(agent,)).fetchone()
+          db.close()
+          if not row:raise SystemExit("Initial receipt record missing")
+          poc_hash,pocid,initial_vul,initial_fix=row
+          if initial_vul not in (77,1) or initial_fix!=0:raise SystemExit("Initial vulnerable/fixed oracle result unexpected")
+          # Same image identity: receipt guard must safely reuse without a target execution.
+          stable=subprocess.run(["bash",str(task/"submit.sh"),str(oracle)],check=True,capture_output=True,text=True)
+          stable_result=json.loads(stable.stdout.strip())
+          # Rebind the local vulnerable tag to the fixed image; no registry tag is changed.
+          subprocess.run(["docker","tag","n132/arvo:1065-fix","n132/arvo:1065-vul"],check=True)
+          # Restart server with the same PoC DB and receipt DB.
+          old_pid=int((root/"server.pid").read_text().strip())
+          try:os.kill(old_pid,signal.SIGTERM)
+          except ProcessLookupError:pass
+          for _ in range(40):
+            try:os.kill(old_pid,0)
+            except ProcessLookupError:break
+            time.sleep(.25)
+          server_log=(root/"server.log").open("a")
+          env=os.environ.copy()
+          restarted=subprocess.Popen([str(py),"-m","cybergym.server","--host","127.0.0.1","--port","8670",
+            "--mask_map_path",str(cyber/"mask_map.json"),"--log_dir",str(root/"server_poc"),
+            "--db_path",str(root/"server_poc/poc.db")],env=env,stdout=server_log,stderr=subprocess.STDOUT)
+          (root/"server.pid").write_text(str(restarted.pid))
+          ready=False
+          for _ in range(60):
+            try:
+              if httpx.get("http://127.0.0.1:8670/openapi.json",timeout=1).status_code==200:ready=True;break
+            except Exception:pass
+            time.sleep(.5)
+          if not ready:raise SystemExit("Patched server failed to recover")
+          # The official verify endpoint now invokes the patched run_poc_id, which checks the receipt image ID.
+          subprocess.run([str(py),str(cyber/"scripts/verify_agent_result.py"),"--server","http://127.0.0.1:8670",
+            "--pocdb_path",str(root/"server_poc/poc.db"),"--agent_id",agent],
+            check=True,capture_output=True,text=True,env=os.environ.copy())
+          db=sqlite3.connect(root/"server_poc/poc.db")
+          row2=db.execute("SELECT vul_exit_code,fix_exit_code,poc_id FROM poc_records WHERE agent_id=?",(agent,)).fetchone()
+          receipts=db.execute("SELECT COUNT(*) FROM execution_receipts").fetchone()[0]
+          db.close()
+          # After the guard invalidates the stale vulnerable-side receipt, current tag points to fixed image.
+          # Therefore the current vulnerable-side rerun must be clean (0); fixed-side remains clean (0).
+          if row2[0]!=0 or row2[1]!=0:raise SystemExit("Receipt guard did not replace stale result with current image result: "+repr(row2))
+          # Repeated same-identity submission must now be a receipt hit and return 0.
+          after=subprocess.run(["bash",str(task/"submit.sh"),str(oracle)],check=True,capture_output=True,text=True)
+          after_result=json.loads(after.stdout.strip())
+          summary={
+            "task_id":"arvo:1065","agent_id":agent,"poc_sha256":poc_hash,
+            "initial_vul_exit_code":initial_vul,"initial_fix_exit_code":initial_fix,
+            "same_identity_receipt_reuse_exit_code":stable_result.get("exit_code"),
+            "after_tag_rebind_and_server_restart_vul_exit_code":row2[0],
+            "after_tag_rebind_and_server_restart_fix_exit_code":row2[1],
+            "same_identity_after_recovery_exit_code":after_result.get("exit_code"),
+            "receipt_rows":receipts,
+            "verdict":"PASS" if row2[0]==0 and row2[1]==0 and after_result.get("exit_code")==0 else "FAIL",
+            "interpretation":"Image-ID-bound sidecar receipts invalidate the stale vulnerable result after a server restart and preserve safe reuse on the current image."
+          }
+          (root/"receipt_guard_summary.json").write_text(json.dumps(summary,indent=2)+"\n")
+          print(json.dumps(summary,indent=2))
+          print("R11_RECEIPT_GUARD_PATCH=PASS")
+          PY
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: echo "Ephemeral runner cleanup; no PoC or raw logs uploaded."
