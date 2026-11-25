@@ -125,7 +125,14 @@ jobs:
             --db_path "$R11_RUN_DIR/server_poc/poc.db" \
             > "$R11_RUN_DIR/server.log" 2>&1 &
           SERVER_PID=$!
-          cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
+          echo "$SERVER_PID" > "$R11_RUN_DIR/server.pid"
+          cleanup() {
+            if [ -f "$R11_RUN_DIR/server.pid" ]; then
+              CURRENT_PID=$(cat "$R11_RUN_DIR/server.pid")
+              kill "$CURRENT_PID" 2>/dev/null || true
+              wait "$CURRENT_PID" 2>/dev/null || true
+            fi
+          }
           trap cleanup EXIT
           READY=0
           for i in $(seq 1 45); do
@@ -187,6 +194,31 @@ jobs:
               subprocess.run(["docker","tag",fix,tag],check=True)
               current=inspect(tag)
               if current["id"]!=fixed["id"]:raise SystemExit("Tag rebind failed")
+              # Simulate service recovery: restart CyberGym while retaining the same SQLite result database.
+              old_pid=int((root/"server.pid").read_text().strip())
+              import signal
+              try: os.kill(old_pid,signal.SIGTERM)
+              except ProcessLookupError: pass
+              for _ in range(40):
+                  try: os.kill(old_pid,0)
+                  except ProcessLookupError: break
+                  time.sleep(.25)
+              server_log=(root/"server.log").open("a")
+              restarted=subprocess.Popen([str(py),"-m","cybergym.server","--host","127.0.0.1","--port","8669",
+                  "--mask_map_path",str(cyber/"mask_map.json"),
+                  "--log_dir",str(root/"server_poc"),
+                  "--db_path",str(root/"server_poc/poc.db")],
+                  env=os.environ.copy(),stdout=server_log,stderr=subprocess.STDOUT)
+              (root/"server.pid").write_text(str(restarted.pid))
+              import httpx
+              ready=False
+              for _ in range(60):
+                  try:
+                      if httpx.get("http://127.0.0.1:8669/openapi.json",timeout=1).status_code==200:
+                          ready=True;break
+                  except Exception: pass
+                  time.sleep(.5)
+              if not ready: raise SystemExit("CyberGym server failed to recover with persistent DB")
               # Direct execution against the current tag is the ground-truth check.
               creates_before_direct=count_creates()
               direct_file=root/f"direct_current_{tid}.log"
@@ -230,7 +262,8 @@ jobs:
                 "container_create_delta_on_stock_reverify":creates_after_verify-creates_after_stale,
                 "receipt_old_key":old_key,"receipt_current_key":new_key,"receipt_mismatch":receipt_mismatch,
                 "receipt_aware_action":receipt_action,
-                "receipt_aware_result_exit_code":direct_code
+                "receipt_aware_result_exit_code":direct_code,
+                "server_restarted_after_tag_rebind":True
               })
           ev.terminate();ev.wait(timeout=5);event_handle.close()
           summary={"study":"Real CyberGym server stale-result cache under local target image tag rebinding",
