@@ -1,0 +1,225 @@
+name: R11 Real-World Stale Verification Cache Intervention
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/r11-stale-cache-intervention.yml"
+
+permissions: {}
+
+jobs:
+  stale-cache:
+    name: Stale result cache under mutable target image tags
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Checkout pinned CyberGym source
+        shell: bash
+        run: |
+          set -euo pipefail
+          CYBERGYM_COMMIT=c6fe2027d39471375920b92cf1025e23a99ffda5
+          git clone --filter=blob:none https://github.com/sunblaze-ucb/cybergym.git "$RUNNER_TEMP/cybergym"
+          git -C "$RUNNER_TEMP/cybergym" checkout "$CYBERGYM_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/cybergym" rev-parse HEAD)" = "$CYBERGYM_COMMIT"
+
+      - name: Install benchmark server dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/cybergym"
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --disable-pip-version-check --upgrade pip
+          .venv/bin/python -m pip install --disable-pip-version-check -e '.[server]' httpx huggingface_hub
+
+      - name: Download only ARVO 1065 and 368 task descriptions
+        shell: bash
+        env:
+          R11_DATA_DIR: ${{ runner.temp }}/r11-stale/data
+        run: |
+          set -euo pipefail
+          mkdir -p "$R11_DATA_DIR"
+          cd "$RUNNER_TEMP/cybergym"
+          R11_DATA_DIR="$R11_DATA_DIR" .venv/bin/python - <<'PY'
+          import os,pathlib,json
+          from huggingface_hub import HfApi,hf_hub_download
+          repo="sunblaze-ucb/cybergym";api=HfApi();rev=api.dataset_info(repo_id=repo).sha
+          files=set(api.list_repo_files(repo_id=repo,repo_type="dataset",revision=rev))
+          required=[]
+          for tid in ("1065","368"):
+              required += [f"data/arvo/{tid}/repo-vul.tar.gz",f"data/arvo/{tid}/description.txt"]
+          missing=[x for x in required if x not in files]
+          if missing:raise SystemExit("Missing task data "+repr(missing))
+          dest=pathlib.Path(os.environ["R11_DATA_DIR"])
+          for f in required:hf_hub_download(repo_id=repo,repo_type="dataset",filename=f,revision=rev,local_dir=str(dest))
+          (dest/"revision.json").write_text(json.dumps({"repo":repo,"revision":rev,"files":required},indent=2)+"\n")
+          print("DATASET_REVISION="+rev)
+          PY
+
+      - name: Pull vulnerable and fixed image pairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tid in 1065 368; do
+            docker pull "n132/arvo:${tid}-vul"
+            docker pull "n132/arvo:${tid}-fix"
+          done
+          docker image inspect n132/arvo:1065-vul n132/arvo:1065-fix n132/arvo:368-vul n132/arvo:368-fix > "$RUNNER_TEMP/r11-stale/images-original.json"
+
+      - name: Extract trusted reference PoCs privately
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r11-stale"
+          mkdir -p "$ROOT/oracle"
+          for tid in 1065 368; do
+            CID=$(docker create --network none "n132/arvo:${tid}-vul")
+            FOUND=0
+            for candidate in /tmp/poc /tmp/testcase /out/poc /testcase; do
+              if docker cp "$CID:$candidate" "$ROOT/oracle/arvo_${tid}.poc" >/dev/null 2>&1 && [ -f "$ROOT/oracle/arvo_${tid}.poc" ] && [ -s "$ROOT/oracle/arvo_${tid}.poc" ]; then
+                FOUND=1; echo "ARVO_${tid}_REFERENCE_PATH=$candidate"; break
+              fi
+            done
+            docker rm -f "$CID" >/dev/null 2>&1 || true
+            if [ "$FOUND" -ne 1 ]; then echo "No trusted PoC in image for arvo:${tid}" >&2; exit 2; fi
+            sha256sum "$ROOT/oracle/arvo_${tid}.poc"
+          done
+
+      - name: Execute stale-cache intervention against real vulnerable/fixed images
+        shell: bash
+        env:
+          R11_RUN_DIR: ${{ runner.temp }}/r11-stale
+          CYBERGYM_DIR: ${{ runner.temp }}/cybergym
+        run: |
+          set -euo pipefail
+          cd "$CYBERGYM_DIR"
+          mkdir -p "$R11_RUN_DIR/server_poc"
+          API_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+          echo "::add-mask::$API_KEY"
+          export CYBERGYM_API_KEY="$API_KEY"
+          .venv/bin/python -m cybergym.server \
+            --host 127.0.0.1 --port 8669 \
+            --mask_map_path "$CYBERGYM_DIR/mask_map.json" \
+            --log_dir "$R11_RUN_DIR/server_poc" \
+            --db_path "$R11_RUN_DIR/server_poc/poc.db" \
+            > "$R11_RUN_DIR/server.log" 2>&1 &
+          SERVER_PID=$!
+          cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
+          trap cleanup EXIT
+          READY=0
+          for i in $(seq 1 45); do
+            curl --fail --silent http://127.0.0.1:8669/openapi.json >/dev/null && READY=1 && break
+            sleep 2
+          done
+          test "$READY" -eq 1
+          R11_RUN_DIR="$R11_RUN_DIR" CYBERGYM_DIR="$CYBERGYM_DIR" .venv/bin/python - <<'PY'
+          import hashlib,json,os,pathlib,sqlite3,subprocess,uuid,time
+          root=pathlib.Path(os.environ["R11_RUN_DIR"]);cyber=pathlib.Path(os.environ["CYBERGYM_DIR"])
+          py=cyber/".venv/bin/python";data=root/"data"/"data"
+          events=root/"docker_events.log"
+          ev=subprocess.Popen(["docker","events","--filter","type=container","--format","{{.Action}} {{.Actor.Attributes.image}}"],
+                              stdout=events.open("w"),stderr=subprocess.DEVNULL,text=True)
+          time.sleep(1)
+          results=[]
+          def inspect(tag):
+              x=json.loads(subprocess.check_output(["docker","image","inspect",tag],text=True))[0]
+              return {"tag":tag,"id":x["Id"],"repo_digests":x.get("RepoDigests",[])}
+          def run_direct(tag,poc,out):
+              cmd=["docker","run","--rm","--network","none","--volume",f"{poc}:/tmp/poc:ro",
+                   tag,"/bin/bash","-c","timeout -s SIGKILL 600 /bin/arvo 2>&1"]
+              p=subprocess.run(cmd,capture_output=True,text=True)
+              out.write_text(p.stdout+"\n"+p.stderr)
+              return p.returncode
+          def count_creates():
+              ev.send_signal(0) if False else None
+              time.sleep(.4)
+              return sum(1 for line in events.read_text().splitlines() if line.startswith("create "))
+          for tid in ("1065","368"):
+              tag=f"n132/arvo:{tid}-vul";fix=f"n132/arvo:{tid}-fix";poc=root/"oracle"/f"arvo_{tid}.poc"
+              original=inspect(tag);fixed=inspect(fix)
+              agent=str(uuid.uuid4());task=root/f"agent_{tid}"
+              subprocess.run([str(py),"-m","cybergym.task.gen_task","--task-id",f"arvo:{tid}",
+                "--agent-id",agent,"--out-dir",str(task),"--data-dir",str(data),
+                "--server","http://127.0.0.1:8669","--mask-map",str(cyber/"mask_map.json"),
+                "--difficulty","level1"],check=True,capture_output=True,text=True)
+              submitted=subprocess.run(["bash",str(task/"submit.sh"),str(poc)],check=True,capture_output=True,text=True)
+              initial=json.loads(submitted.stdout.strip());original_vul_code=initial["exit_code"]
+              subprocess.run([str(py),str(cyber/"scripts/verify_agent_result.py"),"--server","http://127.0.0.1:8669",
+                "--pocdb_path",str(root/"server_poc/poc.db"),"--agent_id",agent],
+                check=True,capture_output=True,text=True,env=os.environ.copy())
+              db=sqlite3.connect(root/"server_poc/poc.db")
+              row=db.execute("SELECT poc_hash,poc_id,vul_exit_code,fix_exit_code FROM poc_records WHERE agent_id=?",(agent,)).fetchone();db.close()
+              if not row:raise SystemExit("Initial verified PoC record missing")
+              poc_hash,pocid,initial_vul,initial_fix=row
+              if initial_vul!=original_vul_code or initial_fix!=0:raise SystemExit("Initial paired vulnerable/fixed result failed")
+              creates_before_cache=count_creates()
+              # Positive control: same task, PoC and image digest; server should reuse the cached vulnerable result.
+              stable_response=subprocess.run(["bash",str(task/"submit.sh"),str(poc)],check=True,capture_output=True,text=True)
+              stable=json.loads(stable_response.stdout.strip())
+              creates_after_stable=count_creates()
+              # Controlled mutable-tag drift: point the vulnerable tag at the fixed image locally.
+              subprocess.run(["docker","tag",fix,tag],check=True)
+              current=inspect(tag)
+              if current["id"]!=fixed["id"]:raise SystemExit("Tag rebind failed")
+              # Direct execution against the current tag is the ground-truth check.
+              direct_file=root/f"direct_current_{tid}.log"
+              direct_code=run_direct(tag,poc,direct_file)
+              # Same agent/task/PoC submitted again to the stock server. It should return the old cached crash.
+              stale_response=subprocess.run(["bash",str(task/"submit.sh"),str(poc)],check=True,capture_output=True,text=True)
+              stale=json.loads(stale_response.stdout.strip())
+              creates_after_stale=count_creates()
+              # Stock re-verification endpoint is invoked again; record whether it actually executes anything.
+              subprocess.run([str(py),str(cyber/"scripts/verify_agent_result.py"),"--server","http://127.0.0.1:8669",
+                "--pocdb_path",str(root/"server_poc/poc.db"),"--agent_id",agent],
+                check=True,capture_output=True,text=True,env=os.environ.copy())
+              creates_after_verify=count_creates()
+              db=sqlite3.connect(root/"server_poc/poc.db")
+              row2=db.execute("SELECT vul_exit_code,fix_exit_code,poc_id FROM poc_records WHERE agent_id=?",(agent,)).fetchone();db.close()
+              cached_vul,cached_fix,cached_id=row2
+              # Evidence-preserving receipt: image ID is part of the execution identity.
+              old_receipt={"task":f"arvo:{tid}","poc_sha256":poc_hash,"image_id":original["id"],
+                           "oracle":"CyberGym:c6fe2027d39471375920b92cf1025e23a99ffda5","command":"/bin/arvo"}
+              new_receipt={**old_receipt,"image_id":current["id"]}
+              old_key=hashlib.sha256(json.dumps(old_receipt,sort_keys=True).encode()).hexdigest()
+              new_key=hashlib.sha256(json.dumps(new_receipt,sort_keys=True).encode()).hexdigest()
+              receipt_mismatch=old_key!=new_key
+              # Receipt-aware policy rejects the stale entry and accepts only the direct current-version result.
+              receipt_action="REEXECUTE_CURRENT_IMAGE" if receipt_mismatch else "REUSE"
+              results.append({
+                "task_id":f"arvo:{tid}","agent_id":agent,"poc_sha256":poc_hash,"poc_id":pocid,
+                "original_vulnerable_image":original,"original_fixed_image":fixed,"current_vulnerable_tag":current,
+                "initial_vul_exit_code":original_vul_code,"initial_verified_vul_exit_code":initial_vul,
+                "initial_verified_fix_exit_code":initial_fix,
+                "stable_same_identity_cached_exit_code":stable.get("exit_code"),
+                "stable_reuse_container_create_delta":creates_after_stable-creates_before_cache,
+                "direct_current_image_exit_code":direct_code,
+                "stock_server_after_retag_exit_code":stale.get("exit_code"),
+                "stock_db_after_retag":{"vul_exit_code":cached_vul,"fix_exit_code":cached_fix,"poc_id":cached_id},
+                "container_create_delta_on_stale_submit":creates_after_stale-creates_after_stable,
+                "container_create_delta_on_stock_reverify":creates_after_verify-creates_after_stale,
+                "receipt_old_key":old_key,"receipt_current_key":new_key,"receipt_mismatch":receipt_mismatch,
+                "receipt_aware_action":receipt_action,
+                "receipt_aware_result_exit_code":direct_code
+              })
+          ev.terminate();ev.wait(timeout=5)
+          summary={"study":"Real CyberGym server stale-result cache under local target image tag rebinding",
+            "tasks":results,
+            "interpretation":"Controlled local tag-rebinding intervention, not a naturally observed production event. Reference PoCs are trusted benchmark inputs; no LLM agent was run."}
+          (root/"stale_cache_summary.json").write_text(json.dumps(summary,indent=2)+"\n")
+          print(json.dumps(summary,indent=2))
+          for x in results:
+              assert x["stable_same_identity_cached_exit_code"]==x["initial_verified_vul_exit_code"]
+              assert x["stable_reuse_container_create_delta"]==0
+              assert x["direct_current_image_exit_code"]==0
+              assert x["stock_server_after_retag_exit_code"]==x["initial_verified_vul_exit_code"]
+              assert x["container_create_delta_on_stale_submit"]==0
+              assert x["container_create_delta_on_stock_reverify"]==0
+              assert x["receipt_mismatch"] and x["receipt_aware_result_exit_code"]==0
+              assert x["receipt_aware_action"]=="REEXECUTE_CURRENT_IMAGE"
+          print("R11_STALE_CACHE_FALSE_CONFIRMATION=REPRODUCED")
+          PY
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: echo "Ephemeral runner cleanup; no PoC or raw sanitizer logs uploaded."
